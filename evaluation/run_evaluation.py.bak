@@ -1,0 +1,298 @@
+import argparse
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from evaluation.evaluate_response import evaluate_answer
+from evaluation.metrics import calculate_metrics
+
+
+RESPONSES_DIR = PROJECT_ROOT / "results" / "responses"
+VERDICTS_DIR = PROJECT_ROOT / "results" / "verdicts"
+METRICS_DIR = PROJECT_ROOT / "results" / "metrics"
+
+
+def load_records(path):
+    if not path.exists():
+        raise FileNotFoundError(f"Missing file:\n{path}")
+
+    with open(path, "r", encoding="utf-8") as file:
+        content = file.read().strip()
+
+    if not content:
+        return []
+
+    # Supports both JSON arrays/objects and JSONL files.
+    if content.startswith("[") or content.startswith("{"):
+        try:
+            data = json.loads(content)
+            if isinstance(data, list):
+                return data
+            return [data]
+        except json.JSONDecodeError:
+            pass
+
+    records = []
+
+    for line_number, line in enumerate(content.splitlines(), start=1):
+        if not line.strip():
+            continue
+
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"Invalid JSON on line {line_number} in {path}: {error}"
+            )
+
+    return records
+
+
+def save_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=2, ensure_ascii=False)
+
+
+def add_breakdowns(metrics, verdicts):
+    by_question_type = defaultdict(list)
+    by_attribute = defaultdict(list)
+
+    for verdict in verdicts:
+        question_type = verdict.get("question_type") or "unknown"
+        attribute = verdict.get("attribute") or "unknown"
+
+        by_question_type[question_type].append(verdict)
+        by_attribute[attribute].append(verdict)
+
+    metrics["question_type_breakdown"] = {
+        key: calculate_metrics(items)
+        for key, items in sorted(by_question_type.items())
+    }
+
+    metrics["attribute_breakdown"] = {
+        key: calculate_metrics(items)
+        for key, items in sorted(by_attribute.items())
+    }
+
+    metrics["unverified_count"] = sum(
+        1 for item in verdicts if item.get("status") == "UNVERIFIED"
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Evaluate HalluBench model responses."
+    )
+
+    parser.add_argument(
+        "--domain",
+        choices=["cricket", "crm"],
+        default="cricket",
+        help="Benchmark domain.",
+    )
+
+    parser.add_argument(
+        "--provider",
+        default="gemini",
+        help="Provider whose responses should be evaluated.",
+    )
+
+    parser.add_argument(
+        "--responses",
+        default=None,
+        help="Optional path to a JSONL response file.",
+    )
+
+    parser.add_argument(
+        "--questions",
+        default=None,
+        help="Optional questions file.",
+    )
+
+    parser.add_argument(
+        "--ground-truth",
+        dest="ground_truth",
+        default=None,
+        help="Optional ground-truth file.",
+    )
+
+    args = parser.parse_args()
+
+    domain = args.domain.lower()
+    provider = args.provider.lower()
+
+    questions_file = (
+        Path(args.questions)
+        if args.questions
+        else PROJECT_ROOT / "data" / "final" / domain / "questions.json"
+    )
+
+    ground_truth_file = (
+        Path(args.ground_truth)
+        if args.ground_truth
+        else PROJECT_ROOT / "data" / "final" / domain / (
+            "ground_truth.jsonl" if domain == "crm" else "ground_truth.json"
+        )
+    )
+
+    responses_file = (
+        Path(args.responses)
+        if args.responses
+        else RESPONSES_DIR / f"{domain}_{provider}.jsonl"
+    )
+
+    for path_name, path in [
+        ("questions", questions_file),
+        ("ground truth", ground_truth_file),
+        ("responses", responses_file),
+    ]:
+        if not path.is_absolute():
+            if path_name == "responses" and args.responses:
+                path = PROJECT_ROOT / path
+            elif path_name != "responses":
+                path = PROJECT_ROOT / path
+
+        if path_name == "questions":
+            questions_file = path
+        elif path_name == "ground truth":
+            ground_truth_file = path
+        else:
+            responses_file = path
+
+    output_prefix = f"{domain}_{provider}"
+
+    verdicts_file = VERDICTS_DIR / f"{output_prefix}_evaluation.json"
+    metrics_file = METRICS_DIR / f"{output_prefix}_metrics.json"
+
+    print()
+    print("=" * 70)
+    print(f"HalluBench | {domain.upper()} | {provider.upper()} Evaluation")
+    print("=" * 70)
+
+    questions = load_records(questions_file)
+
+    # CRM evaluation uses evidence stored in each question.
+    # Avoid loading the large CRM ground-truth file unnecessarily.
+    if domain == "crm":
+        ground_truth = []
+    else:
+        ground_truth = load_records(ground_truth_file)
+
+    responses = load_records(responses_file)
+    print(f"Questions loaded:       {len(questions):,}")
+    print(f"Ground-truth records:   {len(ground_truth):,}")
+    print(f"Response records:       {len(responses):,}")
+
+    question_lookup = {
+        question["question_id"]: question
+        for question in questions
+        if question.get("question_id")
+    }
+
+    verdicts = []
+    skipped = 0
+    unmatched = 0
+
+    for index, response in enumerate(responses, start=1):
+        if response.get("status") != "success":
+            skipped += 1
+            continue
+
+        question_id = response.get("question_id")
+        question = question_lookup.get(question_id)
+
+        if question is None:
+            unmatched += 1
+            print(f"Warning: Question not found: {question_id}")
+            continue
+
+        answer = response.get("answer", "")
+
+        if not str(answer).strip():
+            skipped += 1
+            continue
+
+        verdict = evaluate_answer(
+            question,
+            answer,
+            ground_truth,
+        )
+
+        verdict["provider"] = response.get("provider", provider)
+        verdict["model"] = response.get("model")
+        verdict["latency_seconds"] = response.get("latency_seconds")
+        verdict["usage"] = response.get("usage")
+
+        # Preserve CRM provenance in the verdict.
+        verdict["ground_truth_id"] = question.get("ground_truth_id")
+        verdict["conversation_id"] = question.get("conversation_id")
+        verdict["attribute"] = question.get("attribute")
+
+        verdicts.append(verdict)
+
+        if index % 100 == 0:
+            print(
+                f"Processed {index:,}/{len(responses):,} response records"
+            )
+
+    if not verdicts:
+        print("\nNo successful responses were available to evaluate.")
+        print(f"Skipped responses: {skipped}")
+        print(f"Unmatched questions: {unmatched}")
+        return
+
+    metrics = calculate_metrics(verdicts)
+
+    metrics["domain"] = domain
+    metrics["provider"] = provider
+    metrics["response_file"] = str(responses_file)
+    metrics["evaluated_responses"] = len(verdicts)
+    metrics["skipped_responses"] = skipped
+    metrics["unmatched_responses"] = unmatched
+
+    add_breakdowns(metrics, verdicts)
+
+    save_json(verdicts_file, verdicts)
+    save_json(metrics_file, metrics)
+
+    print()
+    print("=" * 70)
+    print("EVALUATION COMPLETE")
+    print("=" * 70)
+
+    print(f"Domain:               {domain}")
+    print(f"Provider:             {provider}")
+    print(f"Responses evaluated:  {len(verdicts):,}")
+    print(f"Skipped responses:    {skipped:,}")
+    print(f"Unmatched questions:  {unmatched:,}")
+    print(f"Unverified responses: {metrics['unverified_count']:,}")
+
+    print()
+    print(f"Verdicts saved to: {verdicts_file}")
+    print(f"Metrics saved to:  {metrics_file}")
+
+    print()
+    print("METRICS")
+    print("-" * 40)
+
+    for key, value in metrics.items():
+        if isinstance(value, float):
+            print(f"{key}: {value:.4f}")
+        elif isinstance(value, (int, str)):
+            print(f"{key}: {value}")
+
+    print()
+    print("Evaluation uses only successful model responses.")
+    print("UNVERIFIED means the lexical matcher could not establish support.")
+    print("It does not automatically mean the model hallucinated.")
+
+
+if __name__ == "__main__":
+    main()

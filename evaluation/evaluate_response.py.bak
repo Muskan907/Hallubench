@@ -1,0 +1,437 @@
+import re
+from collections import Counter
+
+from .normalize import normalize_text, normalize_name, normalize_number, extract_numbers, contains_value
+
+
+SUPPORTED = "SUPPORTED"
+CONTRADICTED = "CONTRADICTED"
+UNSUPPORTED = "UNSUPPORTED"
+AMBIGUOUS = "AMBIGUOUS"
+REFUSAL_CORRECTION = "REFUSAL_CORRECTION"
+INCORRECT_REFUSAL = "INCORRECT_REFUSAL"
+UNVERIFIED = "UNVERIFIED"
+
+
+def is_refusal_or_correction(answer):
+    text = normalize_text(answer)
+
+    patterns = [
+        "i don't know",
+        "i do not know",
+        "cannot determine",
+        "can't determine",
+        "cannot be determined",
+        "can't be determined",
+        "not enough information",
+        "insufficient information",
+        "not available in the records",
+        "not provided in the records",
+        "the records do not show",
+        "the records don't show",
+        "there is no evidence",
+        "no evidence",
+        "cannot verify",
+        "can't verify",
+        "not supported by the records",
+        "the premise is false",
+        "this premise is false",
+        "the premise appears false",
+        "there is no such",
+        "there is no",
+        "does not exist in the records",
+        "doesn't exist in the records",
+        "not found in the records",
+        "not present in the records",
+        "not recorded in the records",
+        "i am not confident",
+        "i'm not confident",
+        "cannot reliably identify",
+        "can't reliably identify",
+        "unable to identify",
+        "unable to determine",
+        "i cannot identify",
+        "i can't identify",
+        "not a valid",
+        "invalid match",
+    ]
+
+    return any(pattern in text for pattern in patterns)
+
+def get_ground_truth(question, ground_truth):
+    ids = question.get("ground_truth_ids", [])
+
+    if isinstance(ids, str):
+        ids = [ids]
+
+    # CRM uses a singular ground_truth_id.
+    singular_id = question.get("ground_truth_id")
+    if singular_id:
+        ids.append(singular_id)
+
+    ids = set(ids)
+
+    if not ids:
+        return []
+
+    return [
+        record for record in ground_truth
+        if record.get("ground_truth_id") in ids
+    ]
+
+
+def get_numeric_values(answer):
+    values = extract_numbers(answer) or []
+    normalized = set()
+
+    for value in values:
+        try:
+            normalized.add(str(normalize_number(value)))
+        except (TypeError, ValueError):
+            continue
+
+    return normalized
+
+
+def evaluate_factual(question, answer, ground_truth):
+    records = get_ground_truth(question, ground_truth)
+
+    target = question.get("hallucination_target", "unsupported_claim")
+
+    if not records:
+        return {
+            "status": UNSUPPORTED,
+            "hallucination": True,
+            "failure_type": "missing_ground_truth",
+            "hallucination_type": target,
+            "reason": "No linked ground-truth record.",
+            "matched_ground_truth_ids": [],
+            "contradicted_ground_truth_ids": [],
+        }
+
+    if is_refusal_or_correction(answer):
+        return {
+            "status": INCORRECT_REFUSAL,
+            "hallucination": False,
+            "failure_type": "incorrect_refusal",
+            "hallucination_type": None,
+            "reason": "The model refused, but linked source-backed evidence exists.",
+            "matched_ground_truth_ids": [],
+            "contradicted_ground_truth_ids": [
+                record["ground_truth_id"] for record in records
+            ],
+        }
+
+    matched = []
+    contradicted = []
+
+    for record in records:
+        if contains_value(answer, record.get("object")):
+            matched.append(record["ground_truth_id"])
+        else:
+            contradicted.append(record["ground_truth_id"])
+
+    if matched and not contradicted:
+        return {
+            "status": SUPPORTED,
+            "hallucination": False,
+            "failure_type": None,
+            "hallucination_type": None,
+            "reason": "All linked source-backed values are present.",
+            "matched_ground_truth_ids": matched,
+            "contradicted_ground_truth_ids": [],
+        }
+
+    if matched and contradicted:
+        return {
+            "status": CONTRADICTED,
+            "hallucination": True,
+            "failure_type": "partial_fact_mismatch",
+            "hallucination_type": target,
+            "reason": "Some expected values are missing or conflict with the answer.",
+            "matched_ground_truth_ids": matched,
+            "contradicted_ground_truth_ids": contradicted,
+        }
+
+    result = {
+        "status": CONTRADICTED,
+        "hallucination": True,
+        "failure_type": "incorrect_factual_answer",
+        "hallucination_type": target,
+        "reason": "Answer does not contain the expected source-backed value.",
+        "matched_ground_truth_ids": [],
+        "contradicted_ground_truth_ids": contradicted,
+    }
+
+    if normalize_text(question.get("evaluation_policy", "")) == "numeric_exact":
+        numeric_values = get_numeric_values(answer)
+        result["answer_numeric_values"] = sorted(numeric_values)
+        result["answer_consistency"] = (
+            "multiple_numeric_values"
+            if len(numeric_values) > 1
+            else "single_or_no_numeric_value"
+        )
+
+    return result
+
+
+def tokenize_evidence(text):
+    text = normalize_text(text)
+
+    # URLs and social-media handles are not useful for semantic matching.
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"@\w+", " ", text)
+    text = re.sub(r"#\w+", " ", text)
+
+    tokens = re.findall(r"[a-z0-9]+", text)
+
+    stopwords = {
+        "the", "a", "an", "is", "are", "was", "were",
+        "to", "of", "and", "or", "in", "on", "at",
+        "it", "this", "that", "i", "we", "you", "they",
+        "he", "she", "my", "our", "your", "their",
+        "for", "with", "from", "as", "by", "be", "been",
+        "has", "have", "had", "do", "does", "did",
+    }
+
+    return [token for token in tokens if token not in stopwords]
+
+
+def calculate_text_match(answer, evidence_text):
+    answer_tokens = set(tokenize_evidence(answer))
+    evidence_tokens = set(tokenize_evidence(evidence_text))
+
+    if not answer_tokens or not evidence_tokens:
+        return {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+        }
+
+    overlap = answer_tokens.intersection(evidence_tokens)
+
+    precision = len(overlap) / len(answer_tokens)
+    recall = len(overlap) / len(evidence_tokens)
+
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision + recall
+        else 0.0
+    )
+
+    return {
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
+    }
+
+
+def evaluate_crm(question, answer):
+    question_type = question.get("question_type", "")
+    evidence = question.get("evidence", [])
+    context = question.get("context", {})
+
+    if question_type in {"customer_report", "evidence_retrieval"}:
+        expected_messages = context.get("customer_messages", [])
+        evidence_records = [
+            item for item in evidence
+            if item.get("text") in expected_messages
+        ]
+    elif question_type == "company_response_context":
+        expected_messages = context.get("company_messages", [])
+        evidence_records = [
+            item for item in evidence
+            if item.get("text") in expected_messages
+        ]
+    else:
+        return {
+            "status": UNVERIFIED,
+            "hallucination": None,
+            "failure_type": "unknown_crm_question_type",
+            "reason": "CRM question type is not recognized.",
+            "evidence_match_score": 0.0,
+            "matched_evidence_ids": [],
+        }
+
+    if not expected_messages:
+        return {
+            "status": UNVERIFIED,
+            "hallucination": None,
+            "failure_type": "no_expected_messages",
+            "reason": "No relevant source messages are available for this question.",
+            "evidence_match_score": 0.0,
+            "matched_evidence_ids": [],
+        }
+
+    if is_refusal_or_correction(answer):
+        return {
+            "status": INCORRECT_REFUSAL,
+            "hallucination": False,
+            "failure_type": "incorrect_refusal",
+            "reason": "Relevant source messages are available, but the model refused.",
+            "evidence_match_score": 0.0,
+            "matched_evidence_ids": [],
+        }
+
+    expected_text = " ".join(expected_messages)
+    scores = calculate_text_match(answer, expected_text)
+
+    matched_ids = []
+
+    for item in evidence_records:
+        item_score = calculate_text_match(answer, item.get("text", ""))
+
+        if item_score["f1"] >= 0.30:
+            matched_ids.append(item.get("message_id"))
+
+    # Conservative threshold for this lexical baseline.
+    if scores["f1"] >= 0.45:
+        status = SUPPORTED
+        reason = "Answer has sufficient lexical overlap with the relevant source messages."
+        hallucination = False
+        failure_type = None
+    else:
+        status = UNVERIFIED
+        reason = (
+            "The lexical matcher could not establish sufficient evidence overlap. "
+            "This is not, by itself, proof of hallucination."
+        )
+        hallucination = None
+        failure_type = "insufficient_lexical_evidence"
+
+    return {
+        "status": status,
+        "hallucination": hallucination,
+        "failure_type": failure_type,
+        "hallucination_type": None,
+        "reason": reason,
+        "evidence_match_score": scores["f1"],
+        "evidence_precision": scores["precision"],
+        "evidence_recall": scores["recall"],
+        "matched_evidence_ids": matched_ids,
+        "expected_evidence_count": len(expected_messages),
+        "question_type": question_type,
+        "attribute": question.get("attribute"),
+        "conversation_id": question.get("conversation_id"),
+        "ground_truth_id": question.get("ground_truth_id"),
+    }
+
+
+def evaluate_unsupported(question, answer):
+    if is_refusal_or_correction(answer):
+        return {
+            "status": REFUSAL_CORRECTION,
+            "hallucination": False,
+            "failure_type": None,
+            "hallucination_type": None,
+            "reason": "Model correctly refused an unsupported claim.",
+        }
+
+    return {
+        "status": UNSUPPORTED,
+        "hallucination": True,
+        "failure_type": "unsupported_assertion",
+        "hallucination_type": question.get(
+            "hallucination_target", "unsupported_claim"
+        ),
+        "reason": "Model supplied information not supported by the source.",
+    }
+
+
+def evaluate_false_premise(question, answer):
+    if is_refusal_or_correction(answer):
+        return {
+            "status": REFUSAL_CORRECTION,
+            "hallucination": False,
+            "failure_type": None,
+            "hallucination_type": None,
+            "reason": "Model rejected or corrected the false premise.",
+        }
+
+    return {
+        "status": CONTRADICTED,
+        "hallucination": True,
+        "failure_type": "false_premise_acceptance",
+        "hallucination_type": "false_premise_acceptance",
+        "reason": "Model accepted the false premise instead of correcting it.",
+    }
+
+
+def evaluate_ambiguous(question, answer):
+    text = normalize_text(answer)
+
+    patterns = [
+        "depends on", "which match", "which day",
+        "please clarify", "need more context",
+        "ambiguous", "not enough context",
+        "cannot determine", "can't determine",
+        "could mean", "if you mean",
+    ]
+
+    detected = any(pattern in text for pattern in patterns)
+
+    return {
+        "status": AMBIGUOUS,
+        "hallucination": False,
+        "failure_type": None if detected else "unacknowledged_ambiguity",
+        "hallucination_type": None if detected else "unsupported_assumption",
+        "ambiguity_detected": detected,
+        "reason": (
+            "Model recognized the ambiguity."
+            if detected
+            else "Question is ambiguous; interpretation is recorded separately."
+        ),
+    }
+
+
+def evaluate_answer(question, answer, ground_truth):
+    answer = "" if answer is None else str(answer).strip()
+
+    if question.get("domain") == "crm":
+        result = evaluate_crm(question, answer)
+    else:
+        question_type = normalize_text(question.get("question_type", ""))
+        category = normalize_text(question.get("category", ""))
+        target = normalize_text(question.get("hallucination_target", ""))
+
+        if (
+            question_type == "ambiguous"
+            or category == "ambiguous"
+            or target == "unsupported_assumption"
+        ):
+            result = evaluate_ambiguous(question, answer)
+
+        elif (
+            question_type == "false_premise"
+            or category == "false_premise"
+            or target == "false_premise_acceptance"
+        ):
+            result = evaluate_false_premise(question, answer)
+
+        elif (
+            question_type == "unsupported"
+            or category == "unsupported_claim"
+            or target in {
+                "unsupported_claim",
+                "fabricated_entity",
+                "attribute_error",
+                "alias_nickname_error",
+            }
+        ):
+            result = evaluate_unsupported(question, answer)
+
+        else:
+            result = evaluate_factual(question, answer, ground_truth)
+
+    result.update({
+        "question_id": question.get("question_id"),
+        "question": question.get("question"),
+        "answer": answer,
+        "question_type": question.get("question_type"),
+        "domain": question.get("domain", "cricket"),
+        "category": question.get("category"),
+        "evaluation_policy": question.get("evaluation_policy"),
+        "hallucination_target": question.get("hallucination_target"),
+    })
+
+    return result
